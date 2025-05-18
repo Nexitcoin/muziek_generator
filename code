@@ -1,0 +1,2779 @@
+import numpy as np
+import torch
+import threading
+import torch.nn as nn
+import torch.optim as optim
+import librosa
+import librosa.display
+import matplotlib.pyplot as plt
+from PyQt5.QtWidgets import (
+    QApplication, QMainWindow, QPushButton, QLabel, QVBoxLayout, QWidget, 
+    QFileDialog, QProgressBar, QComboBox, QSlider, QMessageBox, QHBoxLayout,
+    QAction, QSizePolicy, QInputDialog, QGroupBox, QTabWidget, QCheckBox, 
+    QDoubleSpinBox, QFormLayout, QDialog, QDialogButtonBox, QSpinBox, 
+    QStatusBar, QStyleFactory
+)
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QSize, QSettings
+from PyQt5.QtGui import QPixmap, QMovie, QPainter, QPen, QColor, QIcon, QPalette
+import os
+import sys
+import logging
+from pydub import AudioSegment
+import soundfile as sf
+import tempfile
+import torch.nn.functional as F
+from scipy.io.wavfile import write as write_wav
+import noisereduce as nr
+from sklearn.preprocessing import MinMaxScaler
+from torch.utils.data import DataLoader, random_split, Dataset
+import glob
+from tqdm import tqdm
+import pickle
+import hashlib
+from pydub.playback import play
+import json
+from scipy.signal import butter, lfilter, hilbert
+from datetime import datetime
+import shutil
+import yaml
+from typing import Dict, List, Optional, Tuple, Any, Union
+from dataclasses import dataclass, field
+from enum import Enum, auto
+import sounddevice as sd
+from torchaudio.transforms import MFCC, MelSpectrogram
+from torchvision import transforms
+from pathlib import Path
+from collections import defaultdict
+import zipfile
+import requests
+from bs4 import BeautifulSoup
+import subprocess
+from abc import ABC, abstractmethod
+import inspect
+from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor
+
+# Configure logging
+logging.basicConfig(
+    filename='music_generator.log',
+    level=logging.DEBUG,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ==================== Enhanced Constants and Enums ====================
+class AudioStyle(Enum):
+    CLASSICAL = "Classical"
+    JAZZ = "Jazz"
+    ROCK = "Rock"
+    ELECTRONIC = "Electronic"
+    AMBIENT = "Ambient"
+    HIPHOP = "HipHop"
+    POP = "Pop"
+    METAL = "Metal"
+    BLUES = "Blues"
+    CUSTOM = "Custom"
+
+class EffectType(Enum):
+    REVERB = auto()
+    DELAY = auto()
+    FLANGER = auto()
+    CHORUS = auto()
+    DISTORTION = auto()
+    PHASER = auto()
+    EQ = auto()
+    COMPRESSOR = auto()
+    LIMITER = auto()
+    PITCH_SHIFT = auto()
+    TIME_STRETCH = auto()
+
+class GenerationMode(Enum):
+    AUTO = "Automatic"
+    INTERACTIVE = "Interactive"
+    HYBRID = "Hybrid"
+
+@dataclass
+class AudioConfig:
+    sample_rate: int = 44100
+    n_fft: int = 2048
+    hop_length: int = 512
+    n_mels: int = 128
+    max_duration: int = 30
+    bit_depth: int = 16
+    channels: int = 1
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+# ==================== Enhanced Feature Cache with LRU ====================
+class FeatureCache:
+    def __init__(self, cache_dir: str = 'feature_cache', max_size_mb: int = 1024):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        self.max_size_mb = max_size_mb
+        self.cache_metadata = self._load_metadata()
+        self._cleanup_cache()
+        self.executor = ThreadPoolExecutor(max_workers=4)
+        
+    def _load_metadata(self) -> Dict[str, Any]:
+        metadata_file = self.cache_dir / "metadata.json"
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, 'r') as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading cache metadata: {e}")
+                return {}
+        return {}
+        
+    def _save_metadata(self) -> None:
+        metadata_file = self.cache_dir / "metadata.json"
+        try:
+            with open(metadata_file, 'w') as f:
+                json.dump(self.cache_metadata, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving cache metadata: {e}")
+        
+    def get_cache_key(self, audio_path: str, params: str) -> str:
+        file_stat = os.stat(audio_path)
+        unique_str = f"{audio_path}-{file_stat.st_mtime}-{params}"
+        return hashlib.sha256(unique_str.encode()).hexdigest()
+        
+    async def get_cached_features(self, audio_path: str, params: str) -> Optional[Dict]:
+        try:
+            cache_key = self.get_cache_key(audio_path, params)
+            cache_file = self.cache_dir / f"{cache_key}.pkl"
+            
+            if cache_file.exists():
+                # Update last accessed time
+                self.cache_metadata[cache_key] = {
+                    'path': str(audio_path),
+                    'last_accessed': datetime.now().isoformat(),
+                    'size': os.path.getsize(cache_file)
+                }
+                self._save_metadata()
+                
+                def load_pickle():
+                    with open(cache_file, 'rb') as f:
+                        return pickle.load(f)
+                
+                return await asyncio.get_event_loop().run_in_executor(self.executor, load_pickle)
+            return None
+        except Exception as e:
+            logger.error(f"Cache error: {str(e)}", exc_info=True)
+            return None
+            
+    async def cache_features(self, audio_path: str, params: str, features: Dict) -> None:
+        try:
+            cache_key = self.get_cache_key(audio_path, params)
+            cache_file = self.cache_dir / f"{cache_key}.pkl"
+            
+            def save_pickle():
+                with open(cache_file, 'wb') as f:
+                    pickle.dump(features, f, protocol=pickle.HIGHEST_PROTOCOL)
+                
+            await asyncio.get_event_loop().run_in_executor(self.executor, save_pickle)
+                
+            # Update metadata
+            file_size = os.path.getsize(cache_file)
+            self.cache_metadata[cache_key] = {
+                'path': str(audio_path),
+                'last_accessed': datetime.now().isoformat(),
+                'size': file_size
+            }
+            self._save_metadata()
+            
+            # Check cache size
+            total_size = sum(info['size'] for info in self.cache_metadata.values()) / (1024 * 1024)
+            if total_size > self.max_size_mb:
+                self._cleanup_cache()
+        except Exception as e:
+            logger.error(f"Cache error: {str(e)}", exc_info=True)
+            
+    def _cleanup_cache(self) -> None:
+        """Clean up cache using LRU policy"""
+        total_size = sum(info['size'] for info in self.cache_metadata.values()) / (1024 * 1024)
+        
+        if total_size > self.max_size_mb:
+            # Sort by last accessed (oldest first)
+            sorted_items = sorted(
+                self.cache_metadata.items(),
+                key=lambda x: x[1]['last_accessed']
+            )
+            
+            deleted_size = 0
+            for cache_key, info in sorted_items:
+                if (total_size - deleted_size) <= self.max_size_mb * 0.9:  # Keep 90% of max size
+                    break
+                    
+                cache_file = self.cache_dir / f"{cache_key}.pkl"
+                try:
+                    deleted_size += info['size'] / (1024 * 1024)
+                    cache_file.unlink()
+                    del self.cache_metadata[cache_key]
+                except Exception as e:
+                    logger.error(f"Error deleting cache file {cache_file}: {e}")
+            
+            self._save_metadata()
+            logger.info(f"Cache cleaned up. Deleted {deleted_size:.2f} MB")
+
+# ==================== Enhanced Audio Feature Extractor ====================
+class AudioFeatureExtractor:
+    def __init__(self, config: AudioConfig = AudioConfig()):
+        self.config = config
+        self.scaler = MinMaxScaler()
+        self.cache = FeatureCache()
+        self.device = torch.device(config.device)
+        self._init_transforms()
+        
+    def _init_transforms(self) -> None:
+        """Initialize torchaudio transforms with device support"""
+        self.mel_fn = MelSpectrogram(
+            sample_rate=self.config.sample_rate,
+            n_fft=self.config.n_fft,
+            hop_length=self.config.hop_length,
+            n_mels=self.config.n_mels
+        ).to(self.device)
+        
+        self.mfcc_fn = MFCC(
+            sample_rate=self.config.sample_rate,
+            n_mfcc=13,
+            melkwargs={
+                'n_fft': self.config.n_fft,
+                'hop_length': self.config.hop_length,
+                'n_mels': self.config.n_mels
+            }
+        ).to(self.device)
+        
+    async def _load_audio(self, audio_path: str) -> Tuple[np.ndarray, int]:
+        """Load audio file with proper resampling and format conversion"""
+        try:
+            if audio_path.lower().endswith('.mp3'):
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpfile:
+                    audio = AudioSegment.from_mp3(audio_path)
+                    if len(audio) > self.config.max_duration * 1000:
+                        audio = audio[:self.config.max_duration * 1000]
+                    audio.export(tmpfile.name, format="wav")
+                    y, sr = librosa.load(tmpfile.name, sr=self.config.sample_rate)
+                    os.unlink(tmpfile.name)
+            else:
+                y, sr = librosa.load(
+                    audio_path, 
+                    sr=self.config.sample_rate, 
+                    duration=self.config.max_duration
+                )
+            return y, sr
+        except Exception as e:
+            logger.error(f"Error loading audio {audio_path}: {e}", exc_info=True)
+            raise
+            
+    async def _extract_torch_features(self, y: np.ndarray, sr: int) -> Dict[str, np.ndarray]:
+        """Extract features using PyTorch for GPU acceleration"""
+        y_tensor = torch.tensor(y, device=self.device).float()
+        
+        # Process in batches if audio is long
+        if len(y_tensor) > 1000000:  # ~22 seconds at 44.1kHz
+            chunks = torch.split(y_tensor, 1000000)
+            mel_chunks = []
+            mfcc_chunks = []
+            
+            for chunk in chunks:
+                mel_chunks.append(self.mel_fn(chunk).cpu().numpy())
+                mfcc_chunks.append(self.mfcc_fn(chunk).cpu().numpy())
+                
+            mel = np.concatenate(mel_chunks, axis=1)
+            mfcc = np.concatenate(mfcc_chunks, axis=1)
+        else:
+            mel = self.mel_fn(y_tensor).cpu().numpy()
+            mfcc = self.mfcc_fn(y_tensor).cpu().numpy()
+        
+        return {
+            'mel': mel,
+            'mfcc': mfcc
+        }
+        
+    async def extract_features(self, audio_path: str) -> Dict[str, Any]:
+        """Extract audio features with caching and enhanced processing"""
+        try:
+            # Check cache first
+            params = f"{self.config.sample_rate}-{self.config.n_fft}-{self.config.hop_length}-{self.config.n_mels}-{self.config.max_duration}"
+            cached = await self.cache.get_cached_features(audio_path, params)
+            if cached:
+                return cached
+                
+            # Load and preprocess audio
+            y, sr = await self._load_audio(audio_path)
+            
+            # Advanced noise reduction
+            y = nr.reduce_noise(
+                y=y, 
+                sr=sr,
+                stationary=True,
+                prop_decrease=0.75,
+                n_fft=self.config.n_fft,
+                hop_length=self.config.hop_length
+            )
+            
+            # Extract features (parallelize where possible)
+            torch_features = await self._extract_torch_features(y, sr)
+            
+            # Extract additional features with librosa
+            tempo, beats = librosa.beat.beat_track(y=y, sr=sr)
+            chroma = librosa.feature.chroma_stft(y=y, sr=sr)
+            spectral_contrast = librosa.feature.spectral_contrast(y=y, sr=sr)
+            tonnetz = librosa.feature.tonnetz(y=y, sr=sr)
+            rms = librosa.feature.rms(y=y)
+            spectral_centroid = librosa.feature.spectral_centroid(y=y, sr=sr)
+            spectral_bandwidth = librosa.feature.spectral_bandwidth(y=y, sr=sr)
+            spectral_rolloff = librosa.feature.spectral_rolloff(y=y, sr=sr)
+            zero_crossing_rate = librosa.feature.zero_crossing_rate(y)
+            poly_features = librosa.feature.poly_features(y=y, sr=sr)
+            
+            # Harmonic and percussive components
+            y_harmonic, y_percussive = librosa.effects.hpss(y)
+            
+            # Beat-synchronous features
+            beat_features = {
+                'beat_times': librosa.frames_to_time(beats, sr=sr),
+                'beat_chroma': librosa.util.sync(chroma, beats, aggregate=np.median),
+                'beat_mfcc': librosa.util.sync(torch_features['mfcc'], beats, aggregate=np.median)
+            }
+            
+            # Normalize features
+            chroma = self.scaler.fit_transform(chroma.T).T
+            spectral_contrast = self.scaler.fit_transform(spectral_contrast.T).T
+            
+            result = {
+                "tempo": tempo,
+                "chroma": chroma,
+                "mel": torch_features['mel'],
+                "mfcc": torch_features['mfcc'],
+                "spectral_contrast": spectral_contrast,
+                "tonnetz": tonnetz,
+                "rms": rms,
+                "spectral_centroid": spectral_centroid,
+                "spectral_bandwidth": spectral_bandwidth,
+                "spectral_rolloff": spectral_rolloff,
+                "zero_crossing_rate": zero_crossing_rate,
+                "harmonic": y_harmonic,
+                "percussive": y_percussive,
+                "poly_features": poly_features,
+                "beat_features": beat_features,
+                "audio": y,
+                "sample_rate": sr,
+                "status": "success"
+            }
+            
+            # Cache the result
+            await self.cache.cache_features(audio_path, params, result)
+            return result
+            
+        except Exception as e:
+            error_msg = f"Feature extraction error: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return {
+                "status": "error",
+                "message": error_msg
+            }
+
+    async def extract_features_from_audio(self, audio_data: np.ndarray, sample_rate: int) -> Dict[str, Any]:
+        """Extract features directly from audio data"""
+        try:
+            # Extract features similar to the file-based version
+            mfcc = librosa.feature.mfcc(y=audio_data, sr=sample_rate, n_mfcc=13)
+            chroma = librosa.feature.chroma_stft(y=audio_data, sr=sample_rate)
+            spectral_centroid = librosa.feature.spectral_centroid(y=audio_data, sr=sample_rate)
+            
+            return {
+                "mfcc": mfcc,
+                "chroma": chroma,
+                "spectral_centroid": spectral_centroid,
+                "status": "success"
+            }
+        except Exception as e:
+            error_msg = f"Feature extraction error: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            return {
+                "status": "error",
+                "message": error_msg
+            }
+
+# ==================== Enhanced Audio Player with Effects ====================
+class AudioPlayer(QThread):
+    playback_position_changed = pyqtSignal(int)
+    playback_finished = pyqtSignal()
+    effect_chain_updated = pyqtSignal(list)
+    
+    def __init__(self):
+        super().__init__()
+        self.current_audio = None
+        self.is_playing = False
+        self.playback_position = 0
+        self.sample_rate = 44100
+        self.volume = 1.0
+        self.stream = None
+        self.lock = threading.Lock()
+        self.effects = {}
+        self.effect_chain = []
+        self._stop_requested = False
+        
+    def load_audio(self, audio_data: np.ndarray, sample_rate: int) -> bool:
+        try:
+            with self.lock:
+                self.current_audio = audio_data
+                self.sample_rate = sample_rate
+                self.playback_position = 0
+                self._stop_requested = False
+                return True
+        except Exception as e:
+            logger.error(f"Audio load error: {str(e)}", exc_info=True)
+            return False
+            
+    def run(self):
+        try:
+            if self.current_audio is None:
+                return
+                
+            self.is_playing = True
+            self.self.position_samples = self.playback_position
+            
+            def callback(outdata, frames, time, status):
+                if not self.is_playing or self._stop_requested:
+                    raise sd.CallbackStop
+                    
+                with self.lock:
+                    end_idx = min(position_samples + frames, len(self.current_audio))
+                    chunk = self.current_audio[position_samples:end_idx] * self.volume
+                    
+                    # Apply effects in chain
+                    for effect in self.effect_chain:
+                        if effect in self.effects:
+                            chunk = self._apply_effect(chunk, effect)
+                    
+                    if len(chunk) < frames:
+                        outdata[:len(chunk)] = chunk.reshape(-1, 1)
+                        outdata[len(chunk):] = 0
+                        raise sd.CallbackStop
+                    else:
+                        outdata[:] = chunk.reshape(-1, 1)
+                        
+                    position_samples += frames
+                    self.playback_position = self.position_samples
+                    self.playback_position_changed.emit(position_samples)
+            
+            self.stream = sd.OutputStream(
+                samplerate=self.sample_rate,
+                channels=1,
+                callback=callback,
+                finished_callback=self.playback_finished.emit
+            )
+            
+            with self.stream:
+                while self.is_playing and not self._stop_requested:
+                    sd.sleep(100)
+                
+        except Exception as e:
+            logger.error(f"Playback error: {str(e)}", exc_info=True)
+        finally:
+            self.is_playing = False
+            
+    def _apply_effect(self, chunk: np.ndarray, effect: str) -> np.ndarray:
+        """Apply a single effect to the audio chunk"""
+        effect_params = self.effects[effect]
+        
+        if effect == "reverb":
+            return AudioEffects.apply_reverb(
+                chunk, 
+                self.sample_rate,
+                wet_level=effect_params.get('wet_level', 0.3),
+                decay_time=effect_params.get('decay_time', 1.0)
+            )
+        elif effect == "delay":
+            return AudioEffects.apply_delay(
+                chunk,
+                self.sample_rate,
+                delay_time=effect_params.get('delay_time', 0.3),
+                feedback=effect_params.get('feedback', 0.5)
+            )
+        elif effect == "eq":
+            return AudioEffects.apply_eq(
+                chunk,
+                self.sample_rate,
+                low_gain=effect_params.get('low_gain', 1.0),
+                mid_gain=effect_params.get('mid_gain', 1.0),
+                high_gain=effect_params.get('high_gain', 1.0)
+            )
+        elif effect == "pitch_shift":
+            return AudioEffects.apply_pitch_shift(
+                chunk,
+                self.sample_rate,
+                n_steps=effect_params.get('n_steps', 0)
+            )
+        return chunk
+            
+    def add_effect(self, effect_type: str, params: Dict) -> None:
+        """Add an effect to the processing chain"""
+        self.effects[effect_type] = params
+        if effect_type not in self.effect_chain:
+            self.effect_chain.append(effect_type)
+            self.effect_chain_updated.emit(self.effect_chain)
+            
+    def remove_effect(self, effect_type: str) -> None:
+        """Remove an effect from the processing chain"""
+        if effect_type in self.effects:
+            del self.effects[effect_type]
+        if effect_type in self.effect_chain:
+            self.effect_chain.remove(effect_type)
+            self.effect_chain_updated.emit(self.effect_chain)
+            
+    def clear_effects(self) -> None:
+        """Clear all effects from the processing chain"""
+        self.effects.clear()
+        self.effect_chain.clear()
+        self.effect_chain_updated.emit(self.effect_chain)
+            
+    def play(self) -> bool:
+        if self.current_audio is not None and not self.is_playing:
+            self._stop_requested = False
+            self.start()
+            return True
+        return False
+        
+    def pause(self) -> bool:
+        if self.is_playing:
+            self.is_playing = False
+            if self.stream:
+                self.stream.close()
+            return True
+        return False
+        
+    def stop(self) -> bool:
+        self._stop_requested = True
+        self.is_playing = False
+        self.playback_position = 0
+        return True
+        
+    def set_position(self, position_samples: int) -> bool:
+        if self.current_audio is not None:
+            with self.lock:
+                self.playback_position = min(max(0, position_samples), len(self.current_audio))
+                return True
+        return False
+        
+    def set_volume(self, volume: float) -> bool:
+        with self.lock:
+            self.volume = min(max(0.0, volume), 1.0)
+            return True
+            
+    def get_duration(self) -> float:
+        if self.current_audio is not None:
+            return len(self.current_audio) / self.sample_rate
+        return 0.0
+
+# ==================== Advanced Audio Effects ====================
+class AudioEffects:
+
+    @staticmethod
+    def apply_lowpass(audio: np.ndarray, sample_rate: int, cutoff: float = 5000.0) -> np.ndarray:
+        """Simple low-pass filter"""
+        b, a = butter(6, cutoff / (sample_rate / 2), btype='low')
+        return lfilter(b, a, audio)
+
+    @staticmethod
+    def apply_reverb(audio: np.ndarray, sample_rate: int, wet_level: float = 0.3, 
+                    decay_time: float = 1.0, diffusion: float = 0.7) -> np.ndarray:
+        """Advanced reverb effect with configurable decay and diffusion"""
+        delayed_signals = []
+        gain = 0.5
+        
+        # Create multiple delay lines with different lengths
+        for delay_ms in [50, 100, 150, 200, 250]:
+            delay_samples = int(delay_ms * sample_rate / 1000)
+            delayed = np.zeros_like(audio)
+            
+            if delay_samples < len(audio):
+                delayed[delay_samples:] = audio[:-delay_samples] * gain
+                
+            # Apply diffusion (all-pass filter)
+            b = [diffusion, 0]
+            a = [1, diffusion]
+            delayed = lfilter(b, a, delayed)
+            
+            delayed_signals.append(delayed)
+            gain *= 0.7  # Reduce gain for longer delays
+            
+        # Combine all delayed signals
+        wet_signal = sum(delayed_signals) / len(delayed_signals)
+        
+        # Apply decay envelope
+        t = np.arange(len(wet_signal)) / sample_rate
+        decay_env = np.exp(-t / decay_time)
+        wet_signal *= decay_env
+        
+        return (1 - wet_level) * audio + wet_level * wet_signal
+    
+    @staticmethod
+    def apply_delay(audio: np.ndarray, sample_rate: int, delay_time: float = 0.3, 
+                   feedback: float = 0.5, modulation: bool = True) -> np.ndarray:
+        """Advanced delay effect with optional modulation"""
+        output = np.zeros_like(audio)
+        delay_samples = int(delay_time * sample_rate)
+        
+        # Add modulation (chorus-like effect)
+        if modulation:
+            mod_depth = int(0.01 * sample_rate)
+            mod_rate = 0.5
+            mod_signal = mod_depth * np.sin(2 * np.pi * mod_rate * np.arange(len(audio)) / sample_rate)
+            delay_samples = np.clip(delay_samples + mod_signal.astype(int), 10, None)
+        
+        for i in range(len(audio)):
+            output[i] = audio[i]
+            if i >= delay_samples[i] if modulation else delay_samples:
+                output[i] += feedback * output[i - (delay_samples[i] if modulation else delay_samples)]
+        
+        return np.clip(output, -1, 1)
+    
+    @staticmethod
+    def apply_flanger(audio: np.ndarray, sample_rate: int, delay: float = 0.002, 
+                     depth: float = 0.003, rate: float = 0.1, feedback: float = 0.3) -> np.ndarray:
+        """Flanger effect"""
+        output = np.zeros_like(audio)
+        delay_samples = int(delay * sample_rate)
+        depth_samples = int(depth * sample_rate)
+        
+        for i in range(len(audio)):
+            mod = depth_samples * np.sin(2 * np.pi * rate * i / sample_rate)
+            delay = delay_samples + mod
+            
+            if i > delay:
+                output[i] = audio[i] + feedback * output[i - int(delay)]
+            else:
+                output[i] = audio[i]
+        
+        return np.clip(output, -1, 1)
+    
+    @staticmethod
+    def apply_distortion(audio: np.ndarray, gain: float = 20.0, tone: float = 0.5, 
+                         mix: float = 0.8) -> np.ndarray:
+        """Wave shaping distortion"""
+        # Apply gain
+        distorted = audio * gain
+        
+        # Soft clipping
+        distorted = np.tanh(distorted)
+        
+        # Tone control (low-pass filter)
+        if tone < 1.0:
+            b, a = butter(4, tone, btype='low')
+            distorted = lfilter(b, a, distorted)
+            
+        return mix * distorted + (1 - mix) * audio
+    
+    @staticmethod
+    def apply_chorus(audio: np.ndarray, sample_rate: int, n_voices: int = 3, 
+                    depth: float = 0.02, rate: float = 0.5, mix: float = 0.5) -> np.ndarray:
+        """Chorus effect with multiple voices"""
+        output = np.zeros_like(audio)
+        depth_samples = int(depth * sample_rate)
+        
+        for voice in range(n_voices):
+            # Different delay and rate for each voice
+            voice_delay = 0.01 + 0.005 * voice
+            voice_rate = rate * (0.9 + 0.2 * np.random.random())
+            voice_phase = 2 * np.pi * np.random.random()
+            
+            delay_samples = int(voice_delay * sample_rate)
+            mod_signal = depth_samples * np.sin(2 * np.pi * voice_rate * np.arange(len(audio)) / sample_rate + voice_phase)
+            
+            for i in range(len(audio)):
+                delayed_idx = i - (delay_samples + mod_signal[i])
+                if delayed_idx >= 0:
+                    output[i] += audio[int(delayed_idx)]
+        
+        # Normalize and mix
+        output = output / n_voices
+        return mix * output + (1 - mix) * audio
+    
+    @staticmethod
+    def apply_phaser(audio: np.ndarray, sample_rate: int, rate: float = 0.5, 
+                    depth: float = 0.8, feedback: float = 0.7, stages: int = 4) -> np.ndarray:
+        """Phaser effect with multiple all-pass filter stages"""
+        output = np.zeros_like(audio)
+        z = np.zeros((stages, 2))  # Filter state for each stage
+        
+        for i in range(len(audio)):
+            # Calculate modulated delay
+            mod = 0.5 + 0.5 * np.sin(2 * np.pi * rate * i / sample_rate)
+            delay = 0.001 + 0.004 * mod * depth
+            
+            # All-pass filter processing
+            x = audio[i] + feedback * output[i-1] if i > 0 else audio[i]
+            
+            for stage in range(stages):
+                # All-pass filter implementation
+                a1 = (1 - delay) / (1 + delay)
+                tmp = x - a1 * z[stage, 0]
+                x = a1 * tmp + z[stage, 0]
+                z[stage, 0] = tmp
+                
+                # Second stage (for stereo effect)
+                tmp = x - a1 * z[stage, 1]
+                x = a1 * tmp + z[stage, 1]
+                z[stage, 1] = tmp
+            
+            output[i] = x
+        
+        return 0.5 * (output + audio)  # Mix with dry signal
+
+    @staticmethod
+    def apply_eq(audio: np.ndarray, sample_rate: int, 
+                low_gain: float = 1.0, mid_gain: float = 1.0, high_gain: float = 1.0) -> np.ndarray:
+        """3-band equalizer effect"""
+        # Low shelf filter (for bass)
+        if low_gain != 1.0:
+            b, a = butter(2, 250/(sample_rate/2), btype='low')
+            low = lfilter(b, a, audio)
+            audio = audio + (low * (low_gain - 1.0))
+        
+        # Band pass filter (for mids)
+        if mid_gain != 1.0:
+            b, a = butter(2, [250/(sample_rate/2), 4000/(sample_rate/2)], btype='band')
+            mid = lfilter(b, a, audio)
+            audio = audio + (mid * (mid_gain - 1.0))
+        
+        # High shelf filter (for treble)
+        if high_gain != 1.0:
+            b, a = butter(2, 4000/(sample_rate/2), btype='high')
+            high = lfilter(b, a, audio)
+            audio = audio + (high * (high_gain - 1.0))
+        
+        return np.clip(audio, -1, 1)
+
+    @staticmethod
+    def apply_compressor(audio: np.ndarray, threshold: float = -20.0, 
+                        ratio: float = 4.0, attack: float = 0.01, release: float = 0.1) -> np.ndarray:
+        """Simple compressor effect"""
+        # Convert to dB
+        threshold_linear = 10 ** (threshold / 20)
+        gain_reduction = 0.0
+        envelope = 0.0
+        output = np.zeros_like(audio)
+        
+        for i in range(len(audio)):
+            # Calculate envelope
+            abs_sample = abs(audio[i])
+            if abs_sample > envelope:
+                envelope = attack * (envelope - abs_sample) + abs_sample
+            else:
+                envelope = release * (envelope - abs_sample) + abs_sample
+            
+            # Calculate gain reduction
+            if envelope > threshold_linear:
+                desired_gain = threshold_linear + (envelope - threshold_linear) / ratio
+                gain_reduction = desired_gain / envelope
+            
+            # Apply gain reduction
+            output[i] = audio[i] * gain_reduction
+        
+        return output
+
+    @staticmethod
+    def apply_pitch_shift(audio: np.ndarray, sample_rate: int, n_steps: float = 0.0) -> np.ndarray:
+        """Pitch shifting effect"""
+        if n_steps == 0:
+            return audio
+            
+        # Use phase vocoder approach for better quality
+        n_fft = 2048
+        hop_length = n_fft // 4
+        
+        # Compute STFT
+        stft = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
+        
+        # Phase vocoder time-stretch
+        # Resample to pitch shift
+        y_shifted = librosa.istft(stft_stretched, hop_length=hop_length)
+        
+        # Resample to maintain original length
+        y_shifted = librosa.resample(y_shifted, orig_sr=sample_rate, target_sr=int(sample_rate * (2 ** (n_steps / 12))))
+        
+        # Trim or pad to match original length
+        if len(y_shifted) > len(audio):
+            y_shifted = y_shifted[:len(audio)]
+        else:
+            y_shifted = np.pad(y_shifted, (0, max(0, len(audio) - len(y_shifted))), mode='constant')
+        
+        return y_shifted
+
+    @staticmethod
+    def apply_time_stretch(audio: np.ndarray, sample_rate: int, rate: float = 1.0) -> np.ndarray:
+        """Time stretching effect"""
+        if rate == 1.0:
+            return audio
+            
+        n_fft = 2048
+        hop_length = n_fft // 4
+        
+        # Compute STFT
+        stft = librosa.stft(audio, n_fft=n_fft, hop_length=hop_length)
+        
+        # Phase vocoder time-stretch
+        stft_stretched = librosa.phase_vocoder(stft, rate=rate)
+        
+        # Inverse STFT
+        y_stretched = librosa.istft(stft_stretched, hop_length=hop_length)
+        
+        return y_stretched
+
+# ==================== Enhanced Waveform Display with Zoom ====================
+class WaveformWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.audio_data = None
+        self.sample_rate = 44100
+        self.playback_position = 0
+        self.spectrogram_mode = False
+        self.zoom_level = 1.0
+        self.view_start = 0.0
+        self.setMinimumHeight(150)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self._waveform_cache = None
+        self._spectrogram_cache = None
+        
+    def set_audio(self, audio_data: np.ndarray, sample_rate: int) -> None:
+        self.audio_data = audio_data
+        self.sample_rate = sample_rate
+        self.zoom_level = 1.0
+        self.view_start = 0.0
+        self._waveform_cache = None
+        self._spectrogram_cache = None
+        self.update()
+        
+    def set_playback_position(self, position_samples: int) -> None:
+        self.playback_position = self.position_samples
+        self.update()
+        
+    def toggle_spectrogram_mode(self, enabled: bool) -> None:
+        self.spectrogram_mode = enabled
+        self.update()
+        
+    def set_zoom_level(self, zoom: float) -> None:
+        self.zoom_level = max(0.1, min(10.0, zoom))
+        self.update()
+        
+    def set_view_start(self, start: float) -> None:
+        self.view_start = max(0.0, min(1.0 - (1.0 / self.zoom_level), start))
+        self.update()
+        
+    def paintEvent(self, event) -> None:
+        painter = QPainter(self)
+        width = self.width()
+        height = self.height()
+        
+        # Draw background
+        painter.fillRect(self.rect(), QColor(30, 30, 30))
+        
+        if self.audio_data is None:
+            return
+            
+        if self.spectrogram_mode:
+            self._draw_spectrogram(painter, width, height)
+        else:
+            self._draw_waveform(painter, width, height)
+            
+        # Draw playback position indicator
+        if self.playback_position > 0:
+            pos_x = ((self.playback_position / len(self.audio_data)) - self.view_start) * self.zoom_level * width
+            if 0 <= pos_x <= width:
+                painter.setPen(QPen(QColor(255, 100, 100), 2))
+                painter.drawLine(pos_x, 0, pos_x, height)
+                
+        # Draw zoom viewport indicator
+        if self.zoom_level > 1.0:
+            view_width = width / self.zoom_level
+            view_x = self.view_start * width
+            painter.setPen(QPen(QColor(100, 100, 255), 1))
+            painter.drawRect(view_x, height - 10, view_width, 8)
+            
+    def _draw_waveform(self, painter: QPainter, width: int, height: int) -> None:
+        """Draw the waveform with zoom support"""
+        if self._waveform_cache is None:
+            self._build_waveform_cache(width)
+            
+        max_values, min_values, rms_values = self._waveform_cache
+        center_y = height / 2
+        
+        # Draw waveform
+        painter.setPen(QPen(QColor(0, 200, 100), 1))
+        for x in range(width):
+            max_y = center_y - max_values[x] * center_y
+            min_y = center_y - min_values[x] * center_y
+            painter.drawLine(x, max_y, x, min_y)
+            
+        # Draw RMS envelope
+        painter.setPen(QPen(QColor(255, 255, 0, 150), 2))
+        for i in range(1, len(rms_values)):
+            y1 = center_y - rms_values[i-1] * center_y
+            y2 = center_y - rms_values[i] * center_y
+            x1 = i * (width / len(rms_values))
+            x2 = (i + 1) * (width / len(rms_values))
+            painter.drawLine(x1, y1, x2, y2)
+            
+    def _build_waveform_cache(self, width: int) -> None:
+        """Precompute waveform data for faster rendering"""
+        start_sample = int(self.view_start * len(self.audio_data))
+        end_sample = int((self.view_start + 1.0 / self.zoom_level) * len(self.audio_data))
+        visible_samples = self.audio_data[start_sample:end_sample]
+        
+        samples_per_pixel = max(1, len(visible_samples) // width)
+        chunks = [visible_samples[i*samples_per_pixel:(i+1)*samples_per_pixel] for i in range(width)]
+        max_values = [np.max(chunk) for chunk in chunks]
+        min_values = [np.min(chunk) for chunk in chunks]
+        
+        # RMS envelope
+        rms_window = int(0.02 * self.sample_rate)  # 20ms window
+        rms_values = []
+        for i in range(0, len(visible_samples), rms_window):
+            chunk = visible_samples[i:i+rms_window]
+            rms = np.sqrt(np.mean(chunk**2))
+            rms_values.append(rms)
+            
+        self._waveform_cache = (max_values, min_values, rms_values)
+            
+    def _draw_spectrogram(self, painter: QPainter, width: int, height: int) -> None:
+        """Draw a simplified spectrogram with zoom support"""
+        if self._spectrogram_cache is None:
+            self._build_spectrogram_cache(width, height)
+            
+        spectrogram = self._spectrogram_cache
+        
+        # Map to color gradient
+        for x in range(width):
+            col_idx = int((x / width) * spectrogram.shape[1])
+            col_idx = min(col_idx, spectrogram.shape[1] - 1)
+            
+            for y in range(height):
+                row_idx = int(((height - y) / height) * spectrogram.shape[0])
+                row_idx = min(row_idx, spectrogram.shape[0] - 1)
+                
+                value = spectrogram[row_idx, col_idx]
+                color = QColor()
+                color.setHsvF(0.3 + 0.7 * value, 1.0, 0.5 + 0.5 * value)
+                painter.setPen(color)
+                painter.drawPoint(x, y)
+                
+    def _build_spectrogram_cache(self, width: int, height: int) -> None:
+        """Precompute spectrogram data for faster rendering"""
+        start_sample = int(self.view_start * len(self.audio_data))
+        end_sample = int((self.view_start + 1.0 / self.zoom_level) * len(self.audio_data))
+        visible_samples = self.audio_data[start_sample:end_sample]
+        
+        # Compute STFT for visible portion
+        n_fft = 2048
+        hop_length = n_fft // 4
+        stft = librosa.stft(visible_samples, n_fft=n_fft, hop_length=hop_length)
+        spectrogram = librosa.amplitude_to_db(np.abs(stft), ref=np.max)
+        
+        # Normalize to 0-1 range
+        spectrogram = (spectrogram - spectrogram.min()) / (spectrogram.max() - spectrogram.min())
+        
+        self._spectrogram_cache = spectrogram
+            
+    def mousePressEvent(self, event) -> None:
+        """Handle mouse clicks to set playback position"""
+        if self.audio_data is not None and event.button() == Qt.LeftButton:
+            pos_x = event.pos().x()
+            position_ratio = self.view_start + (pos_x / self.width()) / self.zoom_level
+            self.position_samples = int(position_ratio * len(self.audio_data))
+            self.playback_position = self.position_samples
+            self.update()
+            
+    def wheelEvent(self, event) -> None:
+        """Handle mouse wheel for zooming"""
+        if self.audio_data is None:
+            return
+            
+        # Get mouse position as ratio of total length
+        mouse_pos = event.pos().x() / self.width()
+        current_view_center = self.view_start + mouse_pos / self.zoom_level
+        
+        # Calculate new zoom level
+        zoom_delta = event.angleDelta().y() / 1200  # Smooth zooming
+        new_zoom = min(10.0, max(0.1, self.zoom_level * (1 + zoom_delta)))
+        
+        # Adjust view start to zoom toward mouse position
+        new_view_start = current_view_center - mouse_pos / new_zoom
+        new_view_start = max(0.0, min(1.0 - (1.0 / new_zoom), new_view_start))
+        
+        self.zoom_level = new_zoom
+        self.view_start = new_view_start
+        self._waveform_cache = None
+        self._spectrogram_cache = None
+        self.update()
+
+# ==================== Advanced Project Manager ====================
+class ProjectManager:
+    def __init__(self, base_dir: str = "projects"):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(exist_ok=True)
+        self._load_project_index()
+        self._current_project = None
+        
+    def _load_project_index(self) -> None:
+        """Load or create project index"""
+        self.index_file = self.base_dir / "projects_index.json"
+        if self.index_file.exists():
+            try:
+                with open(self.index_file, 'r') as f:
+                    self.projects = json.load(f)
+            except Exception as e:
+                logger.error(f"Error loading project index: {e}")
+                self.projects = {}
+        else:
+            self.projects = {}
+            
+    def _save_project_index(self) -> None:
+        """Save project index"""
+        try:
+            with open(self.index_file, 'w') as f:
+                json.dump(self.projects, f, indent=2)
+        except Exception as e:
+            logger.error(f"Error saving project index: {e}")
+            
+    def create_project(self, name: str, description: str = "") -> bool:
+        """Create a new project"""
+        if not name or name in self.projects:
+            return False
+            
+        project_path = self.base_dir / name
+        try:
+            project_path.mkdir()
+            (project_path / "audio").mkdir()
+            (project_path / "configs").mkdir()
+            (project_path / "exports").mkdir()
+            (project_path / "models").mkdir()
+            (project_path / "assets").mkdir()
+            
+            # Create project metadata
+            self.projects[name] = {
+                "created": datetime.now().isoformat(),
+                "modified": datetime.now().isoformat(),
+                "description": description,
+                "audio_files": 0,
+                "configs": 0,
+                "exports": 0,
+                "tags": []
+            }
+            
+            self._save_project_index()
+            self._current_project = name
+            return True
+        except Exception as e:
+            logger.error(f"Error creating project {name}: {e}")
+            return False
+            
+    def get_projects(self) -> List[str]:
+        """Get list of all projects"""
+        return list(self.projects.keys())
+        
+    def get_project_info(self, name: str) -> Optional[Dict]:
+        """Get project metadata"""
+        return self.projects.get(name)
+        
+    def set_current_project(self, name: str) -> bool:
+        """Set the current active project"""
+        if name in self.projects:
+            self._current_project = name
+            return True
+        return False
+        
+    def get_current_project(self) -> Optional[str]:
+        """Get the current active project"""
+        return self._current_project
+        
+    def save_audio(self, project_name: str, audio_data: np.ndarray, 
+                  sample_rate: int, config: Dict) -> bool:
+        """Save audio to project with configuration"""
+        if project_name not in self.projects:
+            return False
+            
+        project_path = self.base_dir / project_name
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        audio_filename = f"audio_{timestamp}.wav"
+        config_filename = f"config_{timestamp}.json"
+        
+        try:
+            # Save audio
+            audio_path = project_path / "audio" / audio_filename
+            write_wav(audio_path, sample_rate, (audio_data * 32767).astype(np.int16))
+            
+            # Save config
+            config_path = project_path / "configs" / config_filename
+            with open(config_path, 'w') as f:
+                json.dump(config, f, indent=2)
+                
+            # Update project metadata
+            self.projects[project_name]["audio_files"] += 1
+            self.projects[project_name]["configs"] += 1
+            self.projects[project_name]["modified"] = datetime.now().isoformat()
+            self._save_project_index()
+            
+            return True
+        except Exception as e:
+            logger.error(f"Error saving to project {project_name}: {e}")
+            return False
+            
+    def export_project(self, project_name: str, format: str = "zip") -> Optional[str]:
+        """Export project to a compressed format"""
+        if project_name not in self.projects:
+            return None
+            
+        project_path = self.base_dir / project_name
+        export_dir = project_path / "exports"
+        export_dir.mkdir(exist_ok=True)
+        
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        export_filename = f"{project_name}_{timestamp}.{format}"
+        export_path = export_dir / export_filename
+        
+        try:
+            if format == "zip":
+                with zipfile.ZipFile(export_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+                    for root, dirs, files in os.walk(project_path):
+                        for file in files:
+                            if "exports" not in root:  # Don't include previous exports
+                                file_path = Path(root) / file
+                                arcname = os.path.relpath(file_path, project_path)
+                                zipf.write(file_path, arcname)
+                                
+            self.projects[project_name]["exports"] += 1
+            self.projects[project_name]["modified"] = datetime.now().isoformat()
+            self._save_project_index()
+            
+            return str(export_path)
+        except Exception as e:
+            logger.error(f"Error exporting project {project_name}: {e}")
+            return None
+            
+    def delete_project(self, project_name: str) -> bool:
+        """Delete a project and all its contents"""
+        if project_name not in self.projects:
+            return False
+            
+        project_path = self.base_dir / project_name
+        try:
+            shutil.rmtree(project_path)
+            del self.projects[project_name]
+            self._save_project_index()
+            if self._current_project == project_name:
+                self._current_project = None
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting project {project_name}: {e}")
+            return False
+            
+    def add_tag_to_project(self, project_name: str, tag: str) -> bool:
+        """Add a tag to a project"""
+        if project_name not in self.projects:
+            return False
+            
+        if tag not in self.projects[project_name]["tags"]:
+            self.projects[project_name]["tags"].append(tag)
+            self._save_project_index()
+            return True
+        return False
+        
+    def get_projects_by_tag(self, tag: str) -> List[str]:
+        """Get all projects with a specific tag"""
+        return [name for name, info in self.projects.items() if tag in info.get("tags", [])]
+
+# ==================== Advanced Model Definitions ====================
+class BaseAudioModel(ABC, nn.Module):
+    """Abstract base class for audio models"""
+    def __init__(self, input_size: int, output_size: int):
+        super().__init__()
+        self.input_size = input_size
+        self.output_size = output_size
+        
+    @abstractmethod
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        pass
+        
+    @abstractmethod
+    def generate(self, seed: Optional[torch.Tensor] = None, length: int = 10) -> torch.Tensor:
+        pass
+
+class AudioGeneratorModel(BaseAudioModel):
+    def __init__(self, input_size: int = 13, hidden_size: int = 256, output_size: int = 13):
+        super().__init__(input_size, output_size)
+        self.hidden_size = hidden_size
+        
+        # Enhanced encoder with residual connections
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.BatchNorm1d(hidden_size * 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # Enhanced decoder with residual connections
+        self.decoder = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.BatchNorm1d(hidden_size * 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            
+            nn.Linear(hidden_size, output_size),
+            nn.Tanh()
+        )
+        
+        # Style embedding
+        self.style_embedding = nn.Embedding(len(AudioStyle), hidden_size)
+        
+    def forward(self, x: torch.Tensor, style_idx: Optional[int] = None) -> torch.Tensor:
+        # Encoder
+        h = self.encoder(x)
+        
+        # Add style embedding if provided
+        if style_idx is not None:
+            style_emb = self.style_embedding(style_idx)
+            h = h + style_emb
+            
+        # Decoder
+        output = self.decoder(h)
+        return output
+        
+    def generate(self, seed: Optional[torch.Tensor] = None, length: int = 10, 
+                style: Optional[AudioStyle] = None) -> torch.Tensor:
+        """Generate sequence from seed or random noise"""
+        if seed is None:
+            seed = torch.randn(1, self.input_size)
+            
+        style_idx = None
+        if style is not None:
+            style_idx = torch.tensor([list(AudioStyle).index(style)], device=seed.device)
+            
+        with torch.no_grad():
+            current = seed
+            outputs = []
+            
+            for _ in range(length):
+                current = self.forward(current, style_idx)
+                outputs.append(current)
+                
+            return torch.cat(outputs, dim=0)
+
+class VAEAudioModel(BaseAudioModel):
+    """Variational Autoencoder for audio generation"""
+    def __init__(self, input_size: int = 13, hidden_size: int = 256, latent_size: int = 64):
+        super().__init__(input_size, input_size)
+        self.latent_size = latent_size
+        
+        # Encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.2),
+            
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.BatchNorm1d(hidden_size * 2),
+            nn.LeakyReLU(0.2)
+        )
+        
+        # Latent space
+        self.fc_mu = nn.Linear(hidden_size * 2, latent_size)
+        self.fc_var = nn.Linear(hidden_size * 2, latent_size)
+        
+        # Decoder
+        self.decoder = nn.Sequential(
+            nn.Linear(latent_size, hidden_size * 2),
+            nn.BatchNorm1d(hidden_size * 2),
+            nn.LeakyReLU(0.2),
+            
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.BatchNorm1d(hidden_size),
+            nn.LeakyReLU(0.2),
+            
+            nn.Linear(hidden_size, input_size),
+            nn.Tanh()
+        )
+        
+    def encode(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        h = self.encoder(x)
+        mu = self.fc_mu(h)
+        log_var = self.fc_var(h)
+        return mu, log_var
+        
+    def reparameterize(self, mu: torch.Tensor, log_var: torch.Tensor) -> torch.Tensor:
+        std = torch.exp(0.5 * log_var)
+        eps = torch.randn_like(std)
+        return mu + eps * std
+        
+    def decode(self, z: torch.Tensor) -> torch.Tensor:
+        return self.decoder(z)
+        
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        mu, log_var = self.encode(x)
+        z = self.reparameterize(mu, log_var)
+        return self.decode(z), mu, log_var
+        
+    def generate(self, seed: Optional[torch.Tensor] = None, length: int = 10) -> torch.Tensor:
+        if seed is None:
+            seed = torch.randn(1, self.latent_size)
+            
+        with torch.no_grad():
+            return self.decode(seed)
+
+class AudioDiscriminator(nn.Module):
+    def __init__(self, input_size: int = 13, hidden_size: int = 128):
+        super().__init__()
+        
+        self.model = nn.Sequential(
+            nn.Linear(input_size, hidden_size),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            
+            nn.Linear(hidden_size, hidden_size * 2),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            
+            nn.Linear(hidden_size * 2, hidden_size),
+            nn.LeakyReLU(0.2),
+            nn.Dropout(0.3),
+            
+            nn.Linear(hidden_size, 1),
+            nn.Sigmoid()
+        )
+        
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model(x)
+
+# ==================== Enhanced Thread Classes ====================
+class AudioGeneratorThread(QThread):
+    progress_updated = pyqtSignal(int, str)  # progress percentage, status message
+    generation_completed = pyqtSignal(dict)
+    feature_extracted = pyqtSignal(dict)
+    preview_available = pyqtSignal(np.ndarray, int)  # audio data, sample rate
+    
+    def __init__(self, model: nn.Module, config: Dict, style: AudioStyle = AudioStyle.ELECTRONIC):
+        super().__init__()
+        self.model = model
+        self.config = config
+        self.style = style
+        self._is_running = True
+        self.feature_extractor = AudioFeatureExtractor()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(self.device)
+        
+    def run(self):
+        try:
+            self.progress_updated.emit(0, "Initializing generation...")
+            
+            # Generate random seed based on config
+            seed = int(self.config['tempo'] * self.config['length'] * 100)
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            
+            # Generate initial noise
+            num_samples = int(self.config['length'] * self.config['sample_rate'])
+            noise = np.random.uniform(-1, 1, size=num_samples)
+            
+            # Process in chunks with overlap
+            chunk_size = 4096
+            overlap = 1024
+            generated_audio = np.zeros(num_samples)
+            
+            for i in range(0, num_samples, chunk_size - overlap):
+                if not self._is_running:
+                    self.generation_completed.emit({"status": "cancelled"})
+                    return
+                    
+                progress = int((i / num_samples) * 80)
+                self.progress_updated.emit(progress, f"Generating chunk {i//chunk_size + 1}/{(num_samples//chunk_size)+1}")
+                
+                # Get current chunk with overlap
+                start_idx = max(0, i - overlap)
+                end_idx = min(i + chunk_size, num_samples)
+                chunk = noise[start_idx:end_idx]
+                
+                # Extract features from the chunk
+                mfcc = librosa.feature.mfcc(
+                    y=chunk, 
+                    sr=self.config['sample_rate'], 
+                    n_mfcc=13
+                )
+                mfcc = np.mean(mfcc, axis=1)
+                
+                # Predict next chunk features
+                with torch.no_grad():
+                    input_tensor = torch.tensor(mfcc, dtype=torch.float32).unsqueeze(0).to(self.device)
+                    output = self.model(input_tensor).cpu().numpy().flatten()
+                
+                # Generate audio from predicted features
+                chunk = self._features_to_audio(output, self.config['sample_rate'])
+                
+                # Apply style-specific processing
+                chunk = self._apply_style_processing(chunk, self.style)
+                
+                # Crossfade with previous chunk
+                if i > 0:
+                    fade_in = np.linspace(0, 1, overlap)
+                    fade_out = np.linspace(1, 0, overlap)
+                    
+                    # Apply crossfade
+                    generated_audio[start_idx:i] = generated_audio[start_idx:i] * fade_out + chunk[:overlap] * fade_in
+                    generated_audio[i:end_idx] = chunk[overlap:]
+                else:
+                    generated_audio[i:end_idx] = chunk
+                
+                # Emit preview every few chunks
+                if i % (chunk_size * 4) == 0:
+                    self.preview_available.emit(generated_audio[:end_idx], self.config['sample_rate'])
+                
+            # Post-processing
+            self.progress_updated.emit(85, "Applying post-processing...")
+            generated_audio = nr.reduce_noise(y=generated_audio, sr=self.config['sample_rate'])
+            
+            # Normalize with style-specific settings
+            if self.style in [AudioStyle.ROCK, AudioStyle.ELECTRONIC]:
+                generated_audio = librosa.util.normalize(generated_audio, norm=np.inf)  # Hard clipping
+            else:
+                generated_audio = librosa.util.normalize(generated_audio)
+                
+            # Extract features of the final audio
+            self.progress_updated.emit(90, "Analyzing generated audio...")
+            features = self.feature_extractor.extract_features_from_audio(
+                generated_audio, 
+                self.config['sample_rate']
+            )
+            self.feature_extracted.emit(features)
+            
+            self.generation_completed.emit({
+                "audio": generated_audio,
+                "sample_rate": self.config['sample_rate'],
+                "features": features,
+                "status": "success"
+            })
+            
+        except Exception as e:
+            error_msg = f"Generation error: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.generation_completed.emit({
+                "status": "error",
+                "message": error_msg
+            })
+            
+    def stop(self) -> None:
+        """Gracefully stop generation"""
+        self._is_running = False
+        
+    def _features_to_audio(self, mfcc: np.ndarray, sr: int) -> np.ndarray:
+        """Convert MFCC features back to audio using advanced synthesis"""
+        n_samples = len(mfcc) * 512  # Arbitrary scaling
+        
+        # Create harmonic and noise components
+        harmonic = np.zeros(n_samples)
+        noise = np.random.normal(0, 0.1, n_samples)
+        
+        # Generate partials based on MFCC coefficients
+        for i, coeff in enumerate(mfcc):
+            if coeff < 0.1:  # Skip insignificant coefficients
+                continue
+                
+            freq = (i+1) * 80  # Scale coefficients to frequencies
+            if freq > sr/2:
+                continue
+                
+            # Add harmonic component
+            harmonic += 0.2 * np.sin(2 * np.pi * freq * np.arange(n_samples) / sr) * coeff
+            
+            # Add inharmonic partials for richness
+            if i % 3 == 0:
+                detune = 1.0 + 0.01 * i
+                harmonic += 0.1 * np.sin(2 * np.pi * freq * detune * np.arange(n_samples) / sr) * coeff
+        
+        # Mix components with envelope
+        envelope = np.linspace(1, 0.5, n_samples)  # Simple decay envelope
+        audio = (harmonic * 0.7 + noise * 0.3) * envelope
+        
+        return librosa.util.normalize(audio)
+        
+    def _apply_style_processing(self, audio: np.ndarray, style: AudioStyle) -> np.ndarray:
+        """Apply style-specific audio processing"""
+        if style == AudioStyle.ROCK:
+            # Add distortion and emphasize mid frequencies
+            audio = AudioEffects.apply_distortion(audio, gain=15.0, tone=0.7)
+            b, a = butter(4, [200/(self.config['sample_rate']/2), 4000/(self.config['sample_rate']/2)], btype='bandpass')
+            audio = lfilter(b, a, audio)
+            
+        elif style == AudioStyle.JAZZ:
+            # Smooth with soft clipping and add warmth
+            audio = np.tanh(audio * 2) / 2
+            audio = AudioEffects.apply_lowpass(audio, self.config['sample_rate'], 5000)
+            
+        elif style == AudioStyle.ELECTRONIC:
+            # Add pumping effect and emphasize bass
+            envelope = np.sin(np.linspace(0, 4*np.pi, len(audio))) * 0.3 + 0.7
+            audio *= envelope
+            b, a = butter(2, 150/(self.config['sample_rate']/2), btype='high')
+            audio = lfilter(b, a, audio)
+            
+        elif style == AudioStyle.CLASSICAL:
+            # Add subtle reverb and smooth
+            audio = AudioEffects.apply_reverb(audio, self.config['sample_rate'], wet_level=0.2)
+            audio = AudioEffects.apply_lowpass(audio, self.config['sample_rate'], 10000)
+            
+        return audio
+
+class ModelTrainer(QThread):
+    progress_updated = pyqtSignal(int, str)  # progress percentage, status message
+    training_completed = pyqtSignal(dict)
+    validation_metrics = pyqtSignal(dict)
+    model_checkpoint = pyqtSignal(dict)  # Intermediate model checkpoints
+    
+    def __init__(self, generator: nn.Module, discriminator: Optional[nn.Module], 
+                 audio_files: List[str], config: Dict):
+        super().__init__()
+        self.generator = generator
+        self.discriminator = discriminator
+        self.audio_files = audio_files
+        self.config = config
+        self._is_running = True
+        self.feature_extractor = AudioFeatureExtractor()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.generator.to(self.device)
+        if self.discriminator:
+            self.discriminator.to(self.device)
+        
+    def run(self):
+        try:
+            self.progress_updated.emit(0, "Preparing training data...")
+            
+            # Prepare training data
+            features = []
+            for i, audio_file in enumerate(self.audio_files):
+                if not self._is_running:
+                    self.training_completed.emit({"status": "cancelled"})
+                    return
+                    
+                progress = int((i / len(self.audio_files)) * 30)
+                self.progress_updated.emit(progress, f"Processing file {i+1}/{len(self.audio_files)}")
+                
+                result = asyncio.run(self.feature_extractor.extract_features(audio_file))
+                if result['status'] == 'success':
+                    # Use multiple feature types
+                    features.append({
+                        'mfcc': result['mfcc'].mean(axis=1),
+                        'chroma': result['chroma'].mean(axis=1),
+                        'spectral': np.concatenate([
+                            result['spectral_centroid'].flatten(),
+                            result['spectral_bandwidth'].flatten(),
+                            result['spectral_contrast'].flatten()
+                        ])
+                    })
+            
+            if not features:
+                self.training_completed.emit({
+                    "status": "error",
+                    "message": "No valid features extracted from audio files"
+                })
+                return
+                
+            # Combine features
+            X_mfcc = np.array([f['mfcc'] for f in features])
+            X_chroma = np.array([f['chroma'] for f in features])
+            X_spectral = np.array([f['spectral'] for f in features])
+            
+            # Convert to tensors
+            X_mfcc = torch.tensor(X_mfcc, dtype=torch.float32).to(self.device)
+            X_chroma = torch.tensor(X_chroma, dtype=torch.float32).to(self.device)
+            X_spectral = torch.tensor(X_spectral, dtype=torch.float32).to(self.device)
+            
+            # Create dataset
+            dataset = torch.utils.data.TensorDataset(X_mfcc, X_chroma, X_spectral)
+            
+            # Split dataset
+            train_size = int(0.8 * len(dataset))
+            val_size = len(dataset) - train_size
+            train_dataset, val_dataset = random_split(dataset, [train_size, val_size])
+            
+            train_loader = DataLoader(
+                train_dataset, 
+                batch_size=self.config['batch_size'], 
+                shuffle=True
+            )
+            val_loader = DataLoader(
+                val_dataset, 
+                batch_size=self.config['batch_size']
+            )
+            
+            # Training setup
+            criterion = nn.MSELoss()
+            optimizer = optim.Adam(
+                self.generator.parameters(), 
+                lr=self.config['learning_rate'],
+                weight_decay=self.config['weight_decay']
+            )
+            
+            # Training loop
+            best_loss = float('inf')
+            best_model = None
+            for epoch in range(self.config['epochs']):
+                if not self._is_running:
+                    self.training_completed.emit({"status": "cancelled"})
+                    return
+                    
+                self.generator.train()
+                train_loss = 0.0
+                
+                for batch_idx, (mfcc, chroma, spectral) in enumerate(train_loader):
+                    optimizer.zero_grad()
+                    
+                    # Forward pass
+                    output = self.generator(mfcc)
+                    
+                    # Multi-feature loss
+                    loss_mfcc = criterion(output, mfcc)
+                    loss_chroma = criterion(self.generator(chroma), chroma)
+                    loss_spectral = criterion(self.generator(spectral), spectral)
+                    
+                    total_loss = loss_mfcc + loss_chroma * 0.5 + loss_spectral * 0.3
+                    total_loss.backward()
+                    optimizer.step()
+                    
+                    train_loss += total_loss.item()
+                    
+                    # Update progress (30-80% for training phase)
+                    batch_progress = 30 + int((batch_idx / len(train_loader)) * 50 * (epoch+1) / self.config['epochs'])
+                    self.progress_updated.emit(
+                        batch_progress, 
+                        f"Epoch {epoch+1}/{self.config['epochs']} - Batch {batch_idx+1}/{len(train_loader)}"
+                    )
+                
+                # Validation
+                self.generator.eval()
+                val_loss = 0.0
+                with torch.no_grad():
+                    for mfcc, chroma, spectral in val_loader:
+                        output = self.generator(mfcc)
+                        val_loss += criterion(output, mfcc).item()
+                
+                avg_train_loss = train_loss / len(train_loader)
+                avg_val_loss = val_loss / len(val_loader)
+                
+                # Emit validation metrics
+                metrics = {
+                    "epoch": epoch + 1,
+                    "train_loss": avg_train_loss,
+                    "val_loss": avg_val_loss
+                }
+                self.validation_metrics.emit(metrics)
+                
+                # Save checkpoint every few epochs
+                if epoch % 5 == 0:
+                    self.model_checkpoint.emit({
+                        "epoch": epoch,
+                        "model_state": self.generator.state_dict(),
+                        "optimizer_state": optimizer.state_dict(),
+                        "loss": avg_val_loss
+                    })
+                
+                # Early stopping if validation loss starts increasing
+                if avg_val_loss < best_loss:
+                    best_loss = avg_val_loss
+                    best_model = self.generator.state_dict()
+                elif epoch > self.config['min_epochs'] and avg_val_loss > best_loss * 1.1:
+                    self.progress_updated.emit(
+                        90, 
+                        f"Early stopping at epoch {epoch+1}"
+                    )
+                    break
+            
+            # Save best model
+            if best_model is not None:
+                self.generator.load_state_dict(best_model)
+            
+            self.progress_updated.emit(95, "Generating samples...")
+            # Generate sample audio for evaluation
+            with torch.no_grad():
+                sample_input = torch.randn(1, 13).to(self.device)
+                sample_output = self.generator(sample_input).cpu().numpy().flatten()
+                sample_audio = self._features_to_audio(sample_output, self.config['sample_rate'])
+            
+            self.training_completed.emit({
+                "status": "success",
+                "message": f"Training completed with best validation loss: {best_loss:.4f}",
+                "model": self.generator,
+                "sample_audio": sample_audio,
+                "sample_rate": self.config['sample_rate']
+            })
+            
+        except Exception as e:
+            error_msg = f"Training error: {str(e)}"
+            logger.error(error_msg, exc_info=True)
+            self.training_completed.emit({
+                "status": "error",
+                "message": error_msg
+            })
+            
+    def stop(self) -> None:
+        """Gracefully stop training"""
+        self._is_running = False
+        
+    def _features_to_audio(self, mfcc: np.ndarray, sr: int) -> np.ndarray:
+        """Convert features to audio for sample generation"""
+        n_samples = len(mfcc) * 512
+        audio = np.random.normal(0, 0.1, n_samples)
+        
+        for i, coeff in enumerate(mfcc):
+            freq = (i+1) * 100
+            if freq > sr/2:
+                continue
+            audio += 0.1 * np.sin(2 * np.pi * freq * np.arange(n_samples) / sr) * coeff
+        
+        return librosa.util.normalize(audio)
+
+# ==================== Advanced Main Application ====================
+class AudioGeneratorApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("Professional AI Audio Generator")
+        self.setGeometry(100, 100, 1200, 900)  # Slightly larger window
+        
+        # Initialize components
+        self.feature_extractor = AudioFeatureExtractor()
+        self.models = {}
+        self.current_audio = None
+        self.audio_player = AudioPlayer()
+        self.project_manager = ProjectManager()
+        self.settings = QSettings("AI Audio Labs", "AI Music Generator")
+        
+        # Enhanced effects presets with more parameters
+        self.effects_presets = {
+            "Clean": {},
+            "Warm": {"lowpass": 4000, "reverb": 0.1, "wet_level": 0.2},
+            "Bright": {"highpass": 200, "chorus": True, "wet_level": 0.3},
+            "Spacey": {"reverb": 0.5, "delay": 0.3, "modulation": True},
+            "Vintage": {"lowpass": 3000, "reverb": 0.2, "distortion": 0.1},
+            "Club": {"reverb": 0.3, "delay": 0.2, "lowpass": 5000, "highpass": 100},
+            "Radio": {"lowpass": 3000, "highpass": 500, "distortion": 0.2},
+            "Wide": {"chorus": True, "stereo": True, "wet_level": 0.4},
+            "Punchy": {"compressor": True, "eq": {"low_gain": 1.2, "mid_gain": 1.0, "high_gain": 0.8}}
+        }
+        
+        # Initialize UI
+        self.setup_ui()
+        self.load_models()
+        self.load_settings()
+        
+        # Initialize default config
+        self.config = {
+            'sample_rate': 44100,
+            'batch_size': 32,
+            'learning_rate': 0.001,
+            'weight_decay': 1e-5,
+            'epochs': 100,
+            'min_epochs': 20,
+            'tempo': 120,
+            'length': 15,
+            'seed': 42,
+            'variation': 50,
+            'complexity': 5
+        }
+        
+        # Connect signals
+        self.audio_player.playback_position_changed.connect(self.update_playback_position)
+        self.audio_player.playback_finished.connect(self.on_playback_finished)
+        self.audio_player.effect_chain_updated.connect(self.update_effect_chain_display)
+        
+    def setup_ui(self):
+        """Setup the enhanced user interface"""
+        central_widget = QWidget(self)
+        self.setCentralWidget(central_widget)
+        main_layout = QVBoxLayout(central_widget)
+        
+        # Create tabs
+        tabs = QTabWidget()
+        main_layout.addWidget(tabs)
+        
+        # Generation Tab
+        gen_tab = QWidget()
+        gen_layout = QVBoxLayout(gen_tab)
+        tabs.addTab(gen_tab, "Generation")
+        
+        # Project Management Group
+        project_group = QGroupBox("Project Management")
+        project_layout = QHBoxLayout()
+        
+        self.project_combo = QComboBox()
+        self.project_combo.addItems(self.project_manager.get_projects())
+        project_layout.addWidget(self.project_combo)
+        
+        self.new_project_btn = QPushButton("New Project")
+        self.new_project_btn.clicked.connect(self.create_project)
+        project_layout.addWidget(self.new_project_btn)
+        
+        self.save_project_btn = QPushButton("Save to Project")
+        self.save_project_btn.clicked.connect(self.save_to_project)
+        project_layout.addWidget(self.save_project_btn)
+        
+        self.export_project_btn = QPushButton("Export Project")
+        self.export_project_btn.clicked.connect(self.export_project)
+        project_layout.addWidget(self.export_project_btn)
+        
+        project_group.setLayout(project_layout)
+        gen_layout.addWidget(project_group)
+        
+        # Style and Parameters Group
+        param_group = QGroupBox("Generation Parameters")
+        param_layout = QVBoxLayout()
+        
+        # Style selection
+        style_layout = QHBoxLayout()
+        style_layout.addWidget(QLabel("Style:"))
+        self.style_combo = QComboBox()
+        self.style_combo.addItems([style.value for style in AudioStyle])
+        style_layout.addWidget(self.style_combo)
+        
+        # Model variant
+        style_layout.addWidget(QLabel("Variant:"))
+        self.variant_combo = QComboBox()
+        self.variant_combo.addItems(["Basic", "Advanced", "Experimental"])
+        style_layout.addWidget(self.variant_combo)
+        param_layout.addLayout(style_layout)
+        
+        # Generation mode
+        mode_layout = QHBoxLayout()
+        mode_layout.addWidget(QLabel("Mode:"))
+        self.mode_combo = QComboBox()
+        self.mode_combo.addItems([mode.value for mode in GenerationMode])
+        mode_layout.addWidget(self.mode_combo)
+        param_layout.addLayout(mode_layout)
+        
+        # Tempo control
+        tempo_layout = QHBoxLayout()
+        self.tempo_slider = QSlider(Qt.Horizontal)
+        self.tempo_slider.setRange(60, 240)  # Extended range
+        self.tempo_slider.setValue(120)
+        self.tempo_label = QLabel(f"Tempo: {self.tempo_slider.value()} BPM")
+        self.tempo_slider.valueChanged.connect(self.update_tempo_label)
+        tempo_layout.addWidget(self.tempo_label)
+        tempo_layout.addWidget(self.tempo_slider)
+        param_layout.addLayout(tempo_layout)
+        
+        # Length control
+        length_layout = QHBoxLayout()
+        self.length_slider = QSlider(Qt.Horizontal)
+        self.length_slider.setRange(5, 600)  # Up to 10 minutes
+        self.length_slider.setValue(30)
+        self.length_label = QLabel(f"Length: {self.length_slider.value()} sec")
+        self.length_slider.valueChanged.connect(self.update_length_label)
+        length_layout.addWidget(self.length_label)
+        length_layout.addWidget(self.length_slider)
+        param_layout.addLayout(length_layout)
+        
+        # Advanced parameters
+        self.advanced_params_btn = QPushButton("Advanced Parameters...")
+        self.advanced_params_btn.clicked.connect(self.show_advanced_parameters)
+        param_layout.addWidget(self.advanced_params_btn)
+        
+        param_group.setLayout(param_layout)
+        gen_layout.addWidget(param_group)
+        
+        # Effects Group
+        effects_group = QGroupBox("Effects & Processing")
+        effects_layout = QVBoxLayout()
+        
+        # Effects chain display
+        self.effect_chain_label = QLabel("Effects: None")
+        effects_layout.addWidget(self.effect_chain_label)
+        
+        # Effects preset
+        effects_preset_layout = QHBoxLayout()
+        effects_preset_layout.addWidget(QLabel("Preset:"))
+        self.effects_combo = QComboBox()
+        self.effects_combo.addItems(list(self.effects_presets.keys()))
+        effects_preset_layout.addWidget(self.effects_combo)
+        
+        self.apply_effects_btn = QPushButton("Apply")
+        self.apply_effects_btn.clicked.connect(self.apply_effects)
+        effects_preset_layout.addWidget(self.apply_effects_btn)
+        effects_layout.addLayout(effects_preset_layout)
+        
+        # Custom effects
+        self.custom_effects_btn = QPushButton("Custom Effects...")
+        self.custom_effects_btn.clicked.connect(self.show_custom_effects)
+        effects_layout.addWidget(self.custom_effects_btn)
+        
+        # Real-time effects toggle
+        self.realtime_effects_check = QCheckBox("Enable Real-time Effects")
+        effects_layout.addWidget(self.realtime_effects_check)
+        
+        effects_group.setLayout(effects_layout)
+        gen_layout.addWidget(effects_group)
+        
+        # Generation Controls
+        self.generate_btn = QPushButton("Generate Audio")
+        self.generate_btn.clicked.connect(self.generate_audio)
+        self.generate_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold;")
+        gen_layout.addWidget(self.generate_btn)
+        
+        # Progress Bar with status label
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setTextVisible(True)
+        gen_layout.addWidget(self.progress_bar)
+        
+        self.status_label = QLabel("Ready")
+        gen_layout.addWidget(self.status_label)
+        
+        # Waveform Display with mode toggle
+        waveform_control_layout = QHBoxLayout()
+        self.waveform_mode_btn = QPushButton("Toggle Spectrogram")
+        self.waveform_mode_btn.clicked.connect(self.toggle_waveform_mode)
+        waveform_control_layout.addWidget(self.waveform_mode_btn)
+        
+        self.waveform_zoom_slider = QSlider(Qt.Horizontal)
+        self.waveform_zoom_slider.setRange(1, 10)
+        self.waveform_zoom_slider.setValue(5)
+        self.waveform_zoom_slider.valueChanged.connect(self.update_waveform_zoom)
+        waveform_control_layout.addWidget(QLabel("Zoom:"))
+        waveform_control_layout.addWidget(self.waveform_zoom_slider)
+        
+        self.waveform_scroll_left = QPushButton("<")
+        self.waveform_scroll_left.clicked.connect(self.scroll_waveform_left)
+        waveform_control_layout.addWidget(self.waveform_scroll_left)
+        
+        self.waveform_scroll_right = QPushButton(">")
+        self.waveform_scroll_right.clicked.connect(self.scroll_waveform_right)
+        waveform_control_layout.addWidget(self.waveform_scroll_right)
+        
+        gen_layout.addLayout(waveform_control_layout)
+        
+        self.waveform = WaveformWidget()
+        gen_layout.addWidget(self.waveform)
+        
+        # Player Controls Group
+        player_group = QGroupBox("Playback Controls")
+        player_layout = QVBoxLayout()
+        
+        # Transport controls
+        transport_layout = QHBoxLayout()
+        
+        self.play_btn = QPushButton()
+        self.play_btn.setIcon(QIcon.fromTheme("media-playback-start"))
+        self.play_btn.clicked.connect(self.play_audio)
+        transport_layout.addWidget(self.play_btn)
+        
+        self.pause_btn = QPushButton()
+        self.pause_btn.setIcon(QIcon.fromTheme("media-playback-pause"))
+        self.pause_btn.clicked.connect(self.pause_audio)
+        self.pause_btn.setEnabled(False)
+        transport_layout.addWidget(self.pause_btn)
+        
+        self.stop_btn = QPushButton()
+        self.stop_btn.setIcon(QIcon.fromTheme("media-playback-stop"))
+        self.stop_btn.clicked.connect(self.stop_audio)
+        self.stop_btn.setEnabled(False)
+        transport_layout.addWidget(self.stop_btn)
+        
+        # Position slider
+        self.position_slider = QSlider(Qt.Horizontal)
+        self.position_slider.setRange(0, 1000)
+        self.position_slider.sliderMoved.connect(self.set_playback_position)
+        transport_layout.addWidget(self.position_slider)
+        
+        # Time labels
+        self.time_layout = QHBoxLayout()
+        self.current_time_label = QLabel("00:00")
+        self.duration_label = QLabel("00:00")
+        self.time_layout.addWidget(self.current_time_label)
+        self.time_layout.addStretch()
+        self.time_layout.addWidget(self.duration_label)
+        
+        player_layout.addLayout(transport_layout)
+        player_layout.addLayout(self.time_layout)
+        
+        # Volume and other controls
+        control_layout = QHBoxLayout()
+        
+        self.volume_slider = QSlider(Qt.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(80)
+        self.volume_slider.valueChanged.connect(self.set_volume)
+        control_layout.addWidget(QLabel("Volume:"))
+        control_layout.addWidget(self.volume_slider)
+        
+        self.loop_checkbox = QCheckBox("Loop")
+        control_layout.addWidget(self.loop_checkbox)
+        
+        player_layout.addLayout(control_layout)
+        player_group.setLayout(player_layout)
+        gen_layout.addWidget(player_group)
+        
+        # Export Button
+        export_layout = QHBoxLayout()
+        self.export_btn = QPushButton("Export Audio...")
+        self.export_btn.clicked.connect(self.export_audio)
+        self.export_btn.setEnabled(False)
+        export_layout.addWidget(self.export_btn)
+        
+        self.export_format_combo = QComboBox()
+        self.export_format_combo.addItems(["WAV", "MP3", "FLAC"])
+        export_layout.addWidget(self.export_format_combo)
+        
+        gen_layout.addLayout(export_layout)
+        
+        # Training Tab
+        train_tab = QWidget()
+        train_layout = QVBoxLayout(train_tab)
+        
+        # Model training section
+        train_group = QGroupBox("Model Training")
+        train_group_layout = QVBoxLayout()
+        
+        # Training file selection
+        file_layout = QHBoxLayout()
+        self.train_file_label = QLabel("No files selected")
+        file_layout.addWidget(self.train_file_label)
+        
+        self.select_train_files_btn = QPushButton("Select Files...")
+        self.select_train_files_btn.clicked.connect(self.select_training_files)
+        file_layout.addWidget(self.select_train_files_btn)
+        train_group_layout.addLayout(file_layout)
+        
+        # Training parameters
+        param_form_layout = QFormLayout()
+        
+        self.epochs_spinbox = QSpinBox()
+        self.epochs_spinbox.setRange(10, 1000)
+        self.epochs_spinbox.setValue(100)
+        param_form_layout.addRow("Epochs:", self.epochs_spinbox)
+        
+        self.batch_size_spinbox = QSpinBox()
+        self.batch_size_spinbox.setRange(8, 128)
+        self.batch_size_spinbox.setValue(32)
+        param_form_layout.addRow("Batch Size:", self.batch_size_spinbox)
+        
+        self.lr_spinbox = QDoubleSpinBox()
+        self.lr_spinbox.setRange(0.00001, 0.01)
+        self.lr_spinbox.setValue(0.001)
+        self.lr_spinbox.setDecimals(5)
+        param_form_layout.addRow("Learning Rate:", self.lr_spinbox)
+        
+        train_group_layout.addLayout(param_form_layout)
+        
+        # Training controls
+        self.train_btn = QPushButton("Train Model")
+        self.train_btn.clicked.connect(self.train_model)
+        self.train_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold;")
+        train_group_layout.addWidget(self.train_btn)
+        
+        # Training progress
+        self.train_progress_bar = QProgressBar()
+        train_group_layout.addWidget(self.train_progress_bar)
+        
+        self.train_status_label = QLabel("Ready to train")
+        train_group_layout.addWidget(self.train_status_label)
+        
+        train_group.setLayout(train_group_layout)
+        train_layout.addWidget(train_group)
+        
+        # Model evaluation section
+        eval_group = QGroupBox("Model Evaluation")
+        eval_layout = QVBoxLayout()
+        
+        self.eval_plot_widget = QLabel("Training metrics will appear here")
+        self.eval_plot_widget.setAlignment(Qt.AlignCenter)
+        self.eval_plot_widget.setStyleSheet("background-color: white;")
+        eval_layout.addWidget(self.eval_plot_widget)
+        
+        eval_group.setLayout(eval_layout)
+        train_layout.addWidget(eval_group)
+        
+        tabs.addTab(train_tab, "Training")
+        
+        # Help Menu
+        menubar = self.menuBar()
+        
+        # File menu
+        file_menu = menubar.addMenu("File")
+        
+        new_project_action = QAction("New Project", self)
+        new_project_action.triggered.connect(self.create_project)
+        file_menu.addAction(new_project_action)
+        
+        export_action = QAction("Export Audio", self)
+        export_action.triggered.connect(self.export_audio)
+        file_menu.addAction(export_action)
+        
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self.close)
+        file_menu.addAction(exit_action)
+        
+        # View menu
+        view_menu = menubar.addMenu("View")
+        
+        dark_theme_action = QAction("Dark Theme", self)
+        dark_theme_action.triggered.connect(lambda: self.set_theme('dark'))
+        view_menu.addAction(dark_theme_action)
+        
+        light_theme_action = QAction("Light Theme", self)
+        light_theme_action.triggered.connect(lambda: self.set_theme('light'))
+        view_menu.addAction(light_theme_action)
+        
+        # Help Menu
+        help_menu = menubar.addMenu("Help")
+        
+        docs_action = QAction("Documentation", self)
+        docs_action.triggered.connect(self.show_documentation)
+        help_menu.addAction(docs_action)
+        
+        about_action = QAction("About", self)
+        about_action.triggered.connect(self.show_about)
+        help_menu.addAction(about_action)
+        
+        # Status Bar
+        self.statusBar().showMessage("Ready")
+        
+    def set_theme(self, theme: str) -> None:
+        """Set application theme (dark or light)"""
+        if theme == 'dark':
+            palette = QPalette()
+            palette.setColor(QPalette.Window, QColor(53, 53, 53))
+            palette.setColor(QPalette.WindowText, Qt.white)
+            palette.setColor(QPalette.Base, QColor(25, 25, 25))
+            palette.setColor(QPalette.AlternateBase, QColor(53, 53, 53))
+            palette.setColor(QPalette.ToolTipBase, Qt.white)
+            palette.setColor(QPalette.ToolTipText, Qt.white)
+            palette.setColor(QPalette.Text, Qt.white)
+            palette.setColor(QPalette.Button, QColor(53, 53, 53))
+            palette.setColor(QPalette.ButtonText, Qt.white)
+            palette.setColor(QPalette.BrightText, Qt.red)
+            palette.setColor(QPalette.Link, QColor(42, 130, 218))
+            palette.setColor(QPalette.Highlight, QColor(42, 130, 218))
+            palette.setColor(QPalette.HighlightedText, Qt.black)
+            QApplication.setPalette(palette)
+        else:
+            QApplication.setPalette(QApplication.style().standardPalette())
+            
+        self.settings.setValue("theme", theme)
+        
+    def load_settings(self) -> None:
+        """Load application settings"""
+        theme = self.settings.value("theme", "dark")
+        self.set_theme(theme)
+        
+    def update_effect_chain_display(self, effects: List[str]) -> None:
+        """Update the effect chain display"""
+        if effects:
+            self.effect_chain_label.setText(f"Effects: {', '.join(effects)}")
+        else:
+            self.effect_chain_label.setText("Effects: None")
+        
+    def update_tempo_label(self) -> None:
+        self.tempo_label.setText(f"Tempo: {self.tempo_slider.value()} BPM")
+        self.config['tempo'] = self.tempo_slider.value()
+        
+    def update_length_label(self) -> None:
+        self.length_label.setText(f"Length: {self.length_slider.value()} sec")
+        self.config['length'] = self.length_slider.value()
+        
+    def update_playback_position(self, position_samples: int) -> None:
+        """Update UI based on playback position"""
+        if self.current_audio is None:
+            return
+            
+        duration = len(self.current_audio["audio"]) / self.current_audio["sample_rate"]
+        current_time = position_samples / self.current_audio["sample_rate"]
+        
+        # Update position slider
+        self.position_slider.setValue(int((position_samples / len(self.current_audio["audio"])) * 1000))
+        
+        # Update time labels
+        self.current_time_label.setText(self._format_time(current_time))
+        self.duration_label.setText(self._format_time(duration))
+        
+        # Update waveform position
+        self.waveform.set_playback_position(position_samples)
+        
+    def _format_time(self, seconds: float) -> str:
+        """Format time in MM:SS format"""
+        minutes = int(seconds // 60)
+        seconds = int(seconds % 60)
+        return f"{minutes:02d}:{seconds:02d}"
+        
+    def on_playback_finished(self) -> None:
+        """Handle playback completion"""
+        self.play_btn.setEnabled(True)
+        self.pause_btn.setEnabled(False)
+        self.stop_btn.setEnabled(False)
+        
+        if self.loop_checkbox.isChecked() and self.current_audio is not None:
+            self.play_audio()
+            
+    def set_playback_position(self, position: int) -> None:
+        """Set playback position from slider"""
+        if self.current_audio is not None:
+            self.position_samples = int((position / 1000) * len(self.current_audio["audio"]))
+            self.audio_player.set_position(position_samples)
+            
+    def set_volume(self, volume: int) -> None:
+        """Set playback volume"""
+        self.audio_player.set_volume(volume / 100)
+        
+    def toggle_waveform_mode(self) -> None:
+        """Toggle between waveform and spectrogram view"""
+        current = self.waveform.spectrogram_mode
+        self.waveform.toggle_spectrogram_mode(not current)
+        
+    def update_waveform_zoom(self, value: int) -> None:
+        """Update waveform zoom level"""
+        self.waveform.set_zoom_level(value / 2.0)  # Map slider 1-10 to zoom 0.5-5.0
+        
+    def scroll_waveform_left(self) -> None:
+        """Scroll waveform view left"""
+        current_start = self.waveform.view_start
+        step = 0.1 / self.waveform.zoom_level
+        self.waveform.set_view_start(max(0, current_start - step))
+        
+    def scroll_waveform_right(self) -> None:
+        """Scroll waveform view right"""
+        current_start = self.waveform.view_start
+        step = 0.1 / self.waveform.zoom_level
+        max_start = 1.0 - (1.0 / self.waveform.zoom_level)
+        self.waveform.set_view_start(min(max_start, current_start + step))
+        
+    def create_project(self) -> None:
+        """Create a new project with name and description"""
+        name, ok = QInputDialog.getText(self, "New Project", "Project name:")
+        if not ok or not name:
+            return
+            
+        description, ok = QInputDialog.getText(self, "New Project", "Description (optional):")
+        if not ok:
+            description = ""
+            
+        if self.project_manager.create_project(name, description):
+            self.project_combo.addItem(name)
+            self.project_combo.setCurrentText(name)
+            self.statusBar().showMessage(f"Created project: {name}")
+        else:
+            QMessageBox.warning(self, "Error", "Project already exists or name invalid")
+            
+    def save_to_project(self) -> None:
+        """Save current audio to selected project"""
+        if self.current_audio is None:
+            QMessageBox.warning(self, "Error", "No audio to save")
+            return
+            
+        project = self.project_combo.currentText()
+        if not project:
+            QMessageBox.warning(self, "Error", "No project selected")
+            return
+            
+        config = {
+            "style": self.style_combo.currentText(),
+            "tempo": self.tempo_slider.value(),
+            "length": self.length_slider.value(),
+            "effects": self.effects_combo.currentText(),
+            "date": datetime.now().isoformat(),
+            "config": self.config
+        }
+        
+        if self.project_manager.save_audio(
+            project,
+            self.current_audio["audio"],
+            self.current_audio["sample_rate"],
+            config
+        ):
+            self.statusBar().showMessage(f"Saved to project: {project}")
+        else:
+            QMessageBox.warning(self, "Error", "Failed to save to project")
+            
+    def export_project(self) -> None:
+        """Export the current project to a zip file"""
+        project = self.project_combo.currentText()
+        if not project:
+            QMessageBox.warning(self, "Error", "No project selected")
+            return
+            
+        export_path = self.project_manager.export_project(project)
+        if export_path:
+            QMessageBox.information(self, "Success", f"Project exported to:\n{export_path}")
+        else:
+            QMessageBox.warning(self, "Error", "Failed to export project")
+            
+    def show_advanced_parameters(self) -> None:
+        """Show dialog for advanced generation parameters"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Advanced Parameters")
+        layout = QFormLayout(dialog)
+        
+        # Add advanced parameters controls
+        self.seed_spinbox = QSpinBox()
+        self.seed_spinbox.setRange(0, 999999)
+        self.seed_spinbox.setValue(int(self.config.get('seed', 0)))
+        layout.addRow("Random Seed:", self.seed_spinbox)
+        
+        self.variation_slider = QSlider(Qt.Horizontal)
+        self.variation_slider.setRange(0, 100)
+        self.variation_slider.setValue(int(self.config.get('variation', 50)))
+        layout.addRow("Variation:", self.variation_slider)
+        
+        self.complexity_slider = QSlider(Qt.Horizontal)
+        self.complexity_slider.setRange(1, 10)
+        self.complexity_slider.setValue(int(self.config.get('complexity', 5)))
+        layout.addRow("Complexity:", self.complexity_slider)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addRow(button_box)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            self.config['seed'] = self.seed_spinbox.value()
+            self.config['variation'] = self.variation_slider.value()
+            self.config['complexity'] = self.complexity_slider.value()
+            
+    def show_custom_effects(self) -> None:
+        """Show dialog for custom effects editing"""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Custom Effects")
+        dialog.setMinimumWidth(400)
+        layout = QFormLayout(dialog)
+        
+        # Reverb controls
+        reverb_group = QGroupBox("Reverb")
+        reverb_layout = QFormLayout()
+        
+        self.reverb_checkbox = QCheckBox("Enable Reverb")
+        self.reverb_checkbox.setChecked(False)
+        reverb_layout.addRow(self.reverb_checkbox)
+        
+        self.reverb_wet_slider = QSlider(Qt.Horizontal)
+        self.reverb_wet_slider.setRange(0, 100)
+        self.reverb_wet_slider.setValue(30)
+        reverb_layout.addRow("Wet Level:", self.reverb_wet_slider)
+        
+        self.reverb_decay_slider = QSlider(Qt.Horizontal)
+        self.reverb_decay_slider.setRange(1, 100)
+        self.reverb_decay_slider.setValue(50)
+        reverb_layout.addRow("Decay Time:", self.reverb_decay_slider)
+        
+        reverb_group.setLayout(reverb_layout)
+        layout.addRow(reverb_group)
+        
+        # EQ controls
+        eq_group = QGroupBox("Equalizer")
+        eq_layout = QFormLayout()
+        
+        self.eq_low_slider = QSlider(Qt.Horizontal)
+        self.eq_low_slider.setRange(0, 200)
+        self.eq_low_slider.setValue(100)
+        eq_layout.addRow("Low Gain:", self.eq_low_slider)
+        
+        self.eq_mid_slider = QSlider(Qt.Horizontal)
+        self.eq_mid_slider.setRange(0, 200)
+        self.eq_mid_slider.setValue(100)
+        eq_layout.addRow("Mid Gain:", self.eq_mid_slider)
+        
+        self.eq_high_slider = QSlider(Qt.Horizontal)
+        self.eq_high_slider.setRange(0, 200)
+        self.eq_high_slider.setValue(100)
+        eq_layout.addRow("High Gain:", self.eq_high_slider)
+        
+        eq_group.setLayout(eq_layout)
+        layout.addRow(eq_group)
+        
+        # Pitch shift
+        pitch_group = QGroupBox("Pitch Shift")
+        pitch_layout = QFormLayout()
+        
+        self.pitch_shift_slider = QSlider(Qt.Horizontal)
+        self.pitch_shift_slider.setRange(-12, 12)
+        self.pitch_shift_slider.setValue(0)
+        pitch_layout.addRow("Semitones:", self.pitch_shift_slider)
+        
+        pitch_group.setLayout(pitch_layout)
+        layout.addRow(pitch_group)
+        
+        # Dialog buttons
+        button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        button_box.accepted.connect(dialog.accept)
+        button_box.rejected.connect(dialog.reject)
+        layout.addRow(button_box)
+        
+        if dialog.exec_() == QDialog.Accepted:
+            # Save custom effect settings
+            effects = {}
+            
+            if self.reverb_checkbox.isChecked():
+                effects['reverb'] = {
+                    'wet_level': self.reverb_wet_slider.value() / 100,
+                    'decay_time': self.reverb_decay_slider.value() / 50
+                }
+            
+            eq_settings = {
+                'low_gain': self.eq_low_slider.value() / 100,
+                'mid_gain': self.eq_mid_slider.value() / 100,
+                'high_gain': self.eq_high_slider.value() / 100
+            }
+            effects['eq'] = eq_settings
+            
+            if self.pitch_shift_slider.value() != 0:
+                effects['pitch_shift'] = {
+                    'n_steps': self.pitch_shift_slider.value()
+                }
+            
+            # Apply to player if real-time effects enabled
+            if self.realtime_effects_check.isChecked():
+                self.audio_player.clear_effects()
+                for effect, params in effects.items():
+                    self.audio_player.add_effect(effect, params)
+            
+            self.statusBar().showMessage("Custom effects configured")
+            
+    def apply_effects(self) -> None:
+        """Apply selected effects to current audio"""
+        if self.current_audio is None:
+            QMessageBox.warning(self, "Error", "No audio loaded")
+            return
+            
+        preset = self.effects_combo.currentText()
+        effects = self.effects_presets[preset]
+        audio = self.current_audio["audio"]
+        sr = self.current_audio["sample_rate"]
+        
+        try:
+            if "lowpass" in effects:
+                audio = AudioEffects.apply_lowpass(audio, sr, effects["lowpass"])
+            if "highpass" in effects:
+                audio = AudioEffects.apply_highpass(audio, sr, effects["highpass"])
+            if "reverb" in effects:
+                wet_level = effects.get("wet_level", 0.3)
+                audio = AudioEffects.apply_reverb(audio, sr, wet_level)
+            if "delay" in effects:
+                audio = AudioEffects.apply_delay(audio, sr)
+            if "distortion" in effects:
+                audio = AudioEffects.apply_distortion(audio)
+            if "eq" in effects:
+                eq_params = effects["eq"]
+                audio = AudioEffects.apply_eq(
+                    audio, sr,
+                    eq_params.get("low_gain", 1.0),
+                    eq_params.get("mid_gain", 1.0),
+                    eq_params.get("high_gain", 1.0)
+                )
+            if "compressor" in effects:
+                audio = AudioEffects.apply_compressor(audio)
+                
+            self.current_audio["audio"] = librosa.util.normalize(audio)
+            self.waveform.set_audio(self.current_audio["audio"], sr)
+            self.statusBar().showMessage(f"Applied effects: {preset}")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to apply effects: {str(e)}")
+            
+    def load_models(self) -> None:
+        """Load or initialize models for each style"""
+        for style in AudioStyle:
+            self.models[style.value.lower()] = AudioGeneratorModel()
+            
+    def generate_audio(self) -> None:
+        """Generate audio using the selected model"""
+        try:
+            selected_style = AudioStyle(self.style_combo.currentText())
+            if selected_style.value.lower() not in self.models:
+                QMessageBox.warning(self, "Error", f"No model found for {selected_style}")
+                return
+
+            self.statusBar().showMessage(f"Generating {selected_style.value} audio...")
+            self.progress_bar.setValue(0)
+            self.generate_btn.setEnabled(False)
+            
+            # Update config with current parameters
+            self.config.update({
+                'tempo': self.tempo_slider.value(),
+                'length': self.length_slider.value(),
+                'sample_rate': 44100,
+                'style': selected_style.value.lower()
+            })
+            
+            # Start generation thread
+            self.generator_thread = AudioGeneratorThread(
+                model=self.models[selected_style.value.lower()],
+                config=self.config,
+                style=selected_style
+            )
+            self.generator_thread.progress_updated.connect(self.update_generation_progress)
+            self.generator_thread.generation_completed.connect(self.on_generation_completed)
+            self.generator_thread.feature_extracted.connect(self.on_features_extracted)
+            self.generator_thread.preview_available.connect(self.on_preview_available)
+            self.generator_thread.start()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Generation error: {str(e)}")
+            self.generate_btn.setEnabled(True)
+            
+    def update_generation_progress(self, progress: int, message: str) -> None:
+        """Update progress during generation"""
+        self.progress_bar.setValue(progress)
+        self.status_label.setText(message)
+        
+    def on_generation_completed(self, result: Dict) -> None:
+        """Handle completion of audio generation"""
+        if result['status'] == 'success':
+            self.current_audio = result
+            self.waveform.set_audio(result["audio"], result["sample_rate"])
+            self.statusBar().showMessage("Generation complete")
+            
+            # Enable playback and export
+            self.play_btn.setEnabled(True)
+            self.export_btn.setEnabled(True)
+            self.apply_effects_btn.setEnabled(True)
+            
+            # Update duration display
+            duration = len(result["audio"]) / result["sample_rate"]
+            self.duration_label.setText(self._format_time(duration))
+            self.position_slider.setRange(0, 1000)
+            
+        elif result['status'] == 'cancelled':
+            self.statusBar().showMessage("Generation cancelled")
+        else:
+            QMessageBox.critical(self, "Error", result['message'])
+            
+        self.generate_btn.setEnabled(True)
+        self.progress_bar.setValue(0)
+        
+    def on_features_extracted(self, features: Dict) -> None:
+        """Handle feature extraction of generated audio"""
+        # Could be used for visualization or further processing
+        pass
+        
+    def on_preview_available(self, audio_data: np.ndarray, sample_rate: int) -> None:
+        """Handle preview audio updates during generation"""
+        self.waveform.set_audio(audio_data, sample_rate)
+            
+    def play_audio(self) -> None:
+        """Play or resume audio playback"""
+        if self.current_audio is None:
+            return
+            
+        if not self.audio_player.load_audio(self.current_audio["audio"], self.current_audio["sample_rate"]):
+            QMessageBox.critical(self, "Error", "Could not load audio for playback")
+            return
+            
+        if self.audio_player.play():
+            self.play_btn.setEnabled(False)
+            self.pause_btn.setEnabled(True)
+            self.stop_btn.setEnabled(True)
+    
+    def pause_audio(self) -> None:
+        """Pause audio playback"""
+        if self.audio_player.pause():
+            self.play_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+    
+    def stop_audio(self) -> None:
+        """Stop audio playback"""
+        if self.audio_player.stop():
+            self.play_btn.setEnabled(True)
+            self.pause_btn.setEnabled(False)
+            self.stop_btn.setEnabled(False)
+            self.position_slider.setValue(0)
+            self.current_time_label.setText("00:00")
+    
+    def export_audio(self) -> None:
+        """Export generated audio to file"""
+        if self.current_audio is None:
+            QMessageBox.warning(self, "Error", "No audio to export")
+            return
+            
+        options = QFileDialog.Options()
+        file_name, _ = QFileDialog.getSaveFileName(
+            self, "Save Audio File", "", 
+            "WAV Files (*.wav);;MP3 Files (*.mp3);;FLAC Files (*.flac)", 
+            options=options)
+            
+        if file_name:
+            try:
+                format = self.export_format_combo.currentText().lower()
+                
+                if format == "mp3":
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as tmpfile:
+                        write_wav(tmpfile.name, self.current_audio["sample_rate"], 
+                                 (self.current_audio["audio"] * 32767).astype(np.int16))
+                        audio = AudioSegment.from_wav(tmpfile.name)
+                        audio.export(file_name, format="mp3", bitrate="192k")
+                        os.unlink(tmpfile.name)
+                elif format == "flac":
+                    sf.write(file_name, self.current_audio["audio"], self.current_audio["sample_rate"])
+                else:  # WAV
+                    write_wav(file_name, self.current_audio["sample_rate"], 
+                             (self.current_audio["audio"] * 32767).astype(np.int16))
+                
+                self.statusBar().showMessage(f"Audio exported to {file_name}")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Export failed: {str(e)}")
+    
+    def select_training_files(self) -> None:
+        """Select audio files for model training"""
+        options = QFileDialog.Options()
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "Select Audio Files for Training", "", 
+            "Audio Files (*.mp3 *.wav *.flac);;All Files (*)", 
+            options=options)
+            
+        if files:
+            self.train_files = files
+            self.train_file_label.setText(f"{len(files)} files selected")
+            
+    def train_model(self) -> None:
+        """Train the selected model with the chosen files"""
+        if not hasattr(self, 'train_files') or not self.train_files:
+            QMessageBox.warning(self, "Error", "No training files selected")
+            return
+            
+        selected_style = self.style_combo.currentText().lower()
+        if selected_style not in self.models:
+            QMessageBox.warning(self, "Error", "Please select a valid style for training")
+            return
+            
+        # Update config with training parameters
+        self.config.update({
+            'epochs': self.epochs_spinbox.value(),
+            'batch_size': self.batch_size_spinbox.value(),
+            'learning_rate': self.lr_spinbox.value(),
+            'weight_decay': 1e-5,
+            'min_epochs': 20
+        })
+            
+        self.statusBar().showMessage(f"Training {selected_style} model...")
+        self.train_progress_bar.setValue(0)
+        self.train_btn.setEnabled(False)
+        
+        # Start training thread
+        self.trainer_thread = ModelTrainer(
+            generator=self.models[selected_style],
+            discriminator=None,  # Could add GAN training in future
+            audio_files=self.train_files,
+            config=self.config
+        )
+        self.trainer_thread.progress_updated.connect(self.update_training_progress)
+        self.trainer_thread.training_completed.connect(self.on_training_completed)
+        self.trainer_thread.validation_metrics.connect(self.update_validation_metrics)
+        self.trainer_thread.model_checkpoint.connect(self.on_model_checkpoint)
+        self.trainer_thread.start()
+    
+    def update_training_progress(self, progress: int, message: str) -> None:
+        """Update training progress"""
+        self.train_progress_bar.setValue(progress)
+        self.train_status_label.setText(message)
+        
+    def update_validation_metrics(self, metrics: Dict) -> None:
+        """Update validation metrics display"""
+        # Could plot training/validation curves here
+        text = f"Epoch {metrics['epoch']}: Train Loss: {metrics['train_loss']:.4f}, Val Loss: {metrics['val_loss']:.4f}"
+        self.train_status_label.setText(text)
+        
+    def on_model_checkpoint(self, checkpoint: Dict) -> None:
+        """Handle model checkpoint during training"""
+        # Could save checkpoint to disk here
+        pass
+        
+    def on_training_completed(self, result: Dict) -> None:
+        """Handle completion of model training"""
+        self.train_btn.setEnabled(True)
+        
+        if result['status'] == 'success':
+            # Update the model with trained weights
+            self.models[self.style_combo.currentText().lower()] = result['model']
+            
+            # Show sample audio if available
+            if 'sample_audio' in result:
+                self.current_audio = {
+                    'audio': result['sample_audio'],
+                    'sample_rate': result['sample_rate']
+                }
+                self.waveform.set_audio(result['sample_audio'], result['sample_rate'])
+                self.play_btn.setEnabled(True)
+                
+            QMessageBox.information(self, "Success", result['message'])
+            self.statusBar().showMessage("Training complete")
+        elif result['status'] == 'cancelled':
+            self.statusBar().showMessage("Training cancelled")
+        else:
+            QMessageBox.critical(self, "Error", result['message'])
+            
+        self.train_progress_bar.setValue(0)
+        
+    def show_documentation(self) -> None:
+        """Show application documentation"""
+        QMessageBox.information(
+            self, 
+            "Documentation", 
+            "Professional AI Audio Generator\n\n"
+            "1. Select a style and parameters\n"
+            "2. Click 'Generate' to create audio\n"
+            "3. Apply effects if desired\n"
+            "4. Save or export your project\n\n"
+            "For training, select audio files that match your desired style."
+        )
+        
+    def show_about(self) -> None:
+        """Show about dialog"""
+        QMessageBox.about(
+            self,
+            "About AI Audio Generator",
+            "Professional AI Audio Generator\nVersion 2.2\n\n"
+            "Advanced audio generation using deep learning models.\n"
+            "Supports multiple styles and effects processing.\n\n"
+            "© 2025 ALBERT ZANTBERGEN"
+        )
+        
+    def closeEvent(self, event) -> None:
+        """Handle application close"""
+        # Stop any ongoing processes
+        if hasattr(self, 'generator_thread') and self.generator_thread.isRunning():
+            self.generator_thread.stop()
+            self.generator_thread.wait()
+            
+        if hasattr(self, 'trainer_thread') and self.trainer_thread.isRunning():
+            self.trainer_thread.stop()
+            self.trainer_thread.wait()
+            
+        if hasattr(self, 'audio_player') and self.audio_player.isPlaying():
+            self.audio_player.stop()
+            
+        # Save settings
+        self.settings.setValue("geometry", self.saveGeometry())
+        event.accept()
+
+if __name__ == "__main__":
+    # Enable high DPI scaling
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling)
+    
+    app = QApplication(sys.argv)
+    app.setStyle('Fusion')  # Modern style
+    
+    # Set application info
+    app.setApplicationName("AI Audio Generator")
+    app.setApplicationVersion("2.2")
+    app.setOrganizationName("AI Audio Labs")
+    
+    window = AudioGeneratorApp()
+    window.show()
+    sys.exit(app.exec_())
